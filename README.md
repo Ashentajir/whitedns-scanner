@@ -32,3 +32,4 @@ This repository contains a scanner for checking Cloudflare-backed targets and re
 
 - The scanner performs active network probing, so only use it on targets you are authorized to test.
 - Some build outputs are intentionally ignored by git, but the two packaged executables are kept trackable in the repository root.
+are we there yet ?
