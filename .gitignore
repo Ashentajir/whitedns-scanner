@@ -16,6 +16,8 @@ cidrs.txt
 
 # Build artifacts
 *.exe
+!scanner.exe
+!scanner_py.exe
 *.spec
 build/
 scanner_py.exe.spec
