@@ -1,0 +1,25 @@
+# Logs
+full_log_*.txt
+hijacked_dns_*.txt
+poisoned_dns_*.txt
+raw_ip_dump_*.txt
+reachable_*.txt
+last_passed.txt
+undead.txt
+
+# Personal files
+domains.txt
+cidrs.txt
+
+# Archives
+*.zip
+
+# Build artifacts
+*.exe
+*.spec
+build/
+scanner_py.exe.spec
+
+# OS files
+.DS_Store
+Thumbs.db

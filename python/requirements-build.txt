@@ -1,0 +1,5 @@
+aiohttp>=3.8.0
+questionary>=1.10.0
+rich>=13.0.0
+dnspython>=2.3.0
+PyInstaller>=5.10.0

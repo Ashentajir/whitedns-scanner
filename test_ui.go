@@ -1,0 +1,1 @@
+﻿package main; import "fmt"; import "reachability-scanner/engine"; import "reachability-scanner/internal/tui"; import tea "github.com/charmbracelet/bubbletea"; func main() { cfg := &engine.ScanConfig{ DnsDiscoveryMode:true }; m := tui.NewModel(cfg); m.Update(tea.WindowSizeMsg{Width: 100, Height: 30}); fmt.Println(m.View()) }
