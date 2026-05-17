@@ -25,3 +25,20 @@ scanner_py.exe.spec
 # OS files
 .DS_Store
 Thumbs.db
+
+# Cross-platform build outputs
+go/build/
+go/build/cross/
+
+# Ignore all text and batch files (user requested)
+*.txt
+*.bat
+
+# Ignore generated logs and reports (explicit)
+full_log_*.txt
+hijacked_dns_*.txt
+poisoned_dns_*.txt
+raw_ip_dump_*.txt
+reachable_*.txt
+last_passed.txt
+undead.txt
