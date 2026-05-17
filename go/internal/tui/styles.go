@@ -3,38 +3,33 @@ package tui
 import "github.com/charmbracelet/lipgloss"
 
 var (
-	// Map Python Rich colors to terminal hex approximations
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#9b30ff")).
+		Foreground(lipgloss.Color("#7bdff2")).
 			Align(lipgloss.Center)
 
 	wrapperStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#9b30ff")).
+		BorderForeground(lipgloss.Color("#7bdff2")).
 			Padding(1, 2)
 
-	stateRunningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Bold(true)
-	statePausedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFF00")).Bold(true)
-	stateStoppedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Bold(true)
+	stateRunningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#8affc1")).Bold(true)
+	statePausedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffe066")).Bold(true)
+	stateStoppedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff6b6b")).Bold(true)
 
-	// Header and text colors tuned to match Python's Rich theme (bright_* equivalents)
-	tableHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#5A5A5A")).Bold(true)
+	tableHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#7bdff2")).Bold(true)
 
-	// Named color approximations used by the Python UI
-	greenText   = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Bold(true) // bold green
-	yellowText  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFF00")).Bold(true) // bold yellow
-	redText     = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF3333")).Bold(true) // bold red
-	cyanText    = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF")).Bold(true) // bold cyan
-	magentaText = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF00FF")).Bold(true) // bold magenta
-	deepPurple  = lipgloss.NewStyle().Foreground(lipgloss.Color("#9b30ff"))            // deep purple
+	greenText   = lipgloss.NewStyle().Foreground(lipgloss.Color("#8affc1")).Bold(true)
+	yellowText  = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffe066")).Bold(true)
+	redText     = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff6b6b")).Bold(true)
+	cyanText    = lipgloss.NewStyle().Foreground(lipgloss.Color("#7bdff2")).Bold(true)
+	magentaText = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff85a1")).Bold(true)
+	deepPurple  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5e60ce"))
 
-	// Dim text for credits and secondary info
-	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6B6B6B"))
+	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#9aa5b1"))
 
-	// DNS Integrity badge styles
-	integrityCleanStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF88")).Bold(true)
-	integrityPoisonedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF3333")).Bold(true)
+	integrityCleanStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#8affc1")).Bold(true)
+	integrityPoisonedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff85a1")).Bold(true)
 )
 
 func statusColor(status int) lipgloss.Style {

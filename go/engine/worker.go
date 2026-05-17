@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -72,24 +73,15 @@ func (e *Engine) scanWorker(ctx context.Context, jobs <-chan Target, results cha
 
 		// ── HTTPS → HTTP Fallback (Anti-Censorship / DPI bypass) ──
 		if probeResult.Status != "PASSED" {
-			if scheme == "https" {
-				// Try HTTP fallback on port 80
-				fallbackResult := PreFlightLayerCheck(ctx, host, 80, "http", layerTimeout, "")
-				if fallbackResult.Status == "PASSED" {
-					scheme = "http"
-					port = 80
-					probeResult = fallbackResult
-				} else {
-					results <- ScanResult{
-						Label:      target.Label,
-						URL:        target.URL,
-						ResolvedIP: probeResult.ResolvedIP,
-						Port:       port,
-						LatencyMs:  int(time.Since(start).Milliseconds()),
-						Error:      probeResult.Status,
-					}
-					continue
-				}
+			fallbackScheme := "http"
+			if scheme == "http" {
+				fallbackScheme = "https"
+			}
+
+			fallbackResult := PreFlightLayerCheck(ctx, host, port, fallbackScheme, layerTimeout, "")
+			if fallbackResult.Status == "PASSED" {
+				scheme = fallbackScheme
+				probeResult = fallbackResult
 			} else {
 				results <- ScanResult{
 					Label:      target.Label,
@@ -97,7 +89,7 @@ func (e *Engine) scanWorker(ctx context.Context, jobs <-chan Target, results cha
 					ResolvedIP: probeResult.ResolvedIP,
 					Port:       port,
 					LatencyMs:  int(time.Since(start).Milliseconds()),
-					Error:      probeResult.Status,
+					Error:      fallbackResult.Status,
 				}
 				continue
 			}
@@ -231,6 +223,11 @@ func (e *Engine) checkStateOrWait(ctx context.Context) bool {
 
 // dnsProtocolPort maps DNS protocol names to their canonical port numbers.
 func dnsProtocolPort(proto string) int {
+	if idx := strings.LastIndex(proto, "/"); idx != -1 && idx < len(proto)-1 {
+		if port, err := strconv.Atoi(proto[idx+1:]); err == nil && port > 0 {
+			return port
+		}
+	}
 	switch proto {
 	case "UDP":
 		return 53
@@ -264,6 +261,10 @@ func (e *Engine) dnsWorker(ctx context.Context, jobs <-chan Target, results chan
 		}
 
 		resolverIP := target.Host
+		answerDomain := e.config.TargetDomain
+		if e.config.DnsTxtMode {
+			answerDomain = e.config.DnsTxtDomain
+		}
 
 		// Determine ports to probe: default to standard DNS behavior
 		// (UDP/TCP on 53 + DoT 853 + DoH 443). Custom ports override only
@@ -273,29 +274,49 @@ func (e *Engine) dnsWorker(ctx context.Context, jobs <-chan Target, results chan
 			probePorts = nil
 		}
 
-		// Run the layered DNS probe. Respect DnsUdpTcpOnly config flag to optionally
-		// restrict probes to UDP/TCP only (no DoT/DoH).
-		probeResults := DnsProbe(ctx, resolverIP, domain, truth, timeout, e.configuredDialer(), e.configuredDoHClient(), probePorts, e.config.DnsUdpTcpOnly)
+		var probeResults []DnsProbeResult
+		if e.config.DnsTxtMode {
+			probeResults = DnsProbeTXT(ctx, resolverIP, answerDomain, timeout, e.configuredDialer(), e.configuredDoHClient(), probePorts)
+		} else {
+			// Run the layered DNS probe. Respect DnsUdpTcpOnly config flag to optionally
+			// restrict probes to UDP/TCP only (no DoT/DoH).
+			probeResults = DnsProbe(ctx, resolverIP, domain, truth, timeout, e.configuredDialer(), e.configuredDoHClient(), probePorts, e.config.DnsUdpTcpOnly)
+		}
 
 		// Emit one ScanResult per protocol probe
 		for _, pr := range probeResults {
 			port := dnsProtocolPort(pr.Protocol)
 			answerIP := ""
+			answerText := ""
+			if len(pr.AnswerTXT) > 0 {
+				answerText = pr.AnswerTXT[0]
+			}
 			if len(pr.AnswerIPs) > 0 {
 				answerIP = pr.AnswerIPs[0]
+				if answerText == "" {
+					answerText = answerIP
+				}
 			}
 
 			status := 0
 			errStr := pr.Error
 			if pr.Responded {
 				status = 1 // 1 = responded (non-HTTP, so we use 1 as "alive")
-				errStr = ""
+			}
+
+			if pr.IsPoisoned {
+				if errStr == "" {
+					errStr = "POISONED"
+				} else {
+					errStr = fmt.Sprintf("%s; POISONED", errStr)
+				}
 			}
 
 			results <- ScanResult{
 				Label:       target.Label,
 				URL:         fmt.Sprintf("dns://%s:%d", resolverIP, port),
 				ResolvedIP:  answerIP,
+				DnsAnswer:   answerText,
 				Port:        port,
 				Status:      status,
 				LatencyMs:   int(pr.TTFB.Milliseconds()),

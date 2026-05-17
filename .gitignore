@@ -42,3 +42,27 @@ raw_ip_dump_*.txt
 reachable_*.txt
 last_passed.txt
 undead.txt
+
+# Platform-specific builds and archives
+# Android, macOS, Linux builds
+go/scanner-*
+go/scanner*.exe
+scanner.exe
+
+# Build matrix scripts and logs
+build_matrix.ps1
+build_matrix.sh
+*.log
+
+# Personal / packaging
+package/
+standalone/
+*.rar
+*.7z
+*.zip
+
+# Virtualenvs and local config
+.venv/
+*.env
+*.key
+*.pem

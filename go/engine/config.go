@@ -27,6 +27,10 @@ type ScanConfig struct {
 	TargetDomain     string // Domain used for integrity verification against truth table (default "google.com")
 	DnsUdpTcpOnly    bool   // If true, only run UDP/TCP probes (no DoT/DoH)
 	DnsMaxPingMs     int    // Max acceptable DNS ping (ms) before marking as failed
+	// TXT probe mode fields
+	DnsTxtMode         bool   // If true, probe resolvers with TXT queries against DnsTxtDomain
+	DnsTxtDomain       string // Base domain for TXT lookups (random label is prepended at runtime)
+	DnsTxtResolversRaw string // Optional inline resolver list for TXT mode, comma/newline separated
 	// Streaming mode: read targets from disk as a stream instead of loading into memory
 	Streaming bool
 	// If true, perform a fast line-count pass to get an accurate total for progress.
@@ -60,6 +64,9 @@ func DefaultConfig() *ScanConfig {
 		TargetDomain:     "google.com",
 		DnsUdpTcpOnly:    false,
 		DnsMaxPingMs:     20000,
+		DnsTxtMode:         false,
+		DnsTxtDomain:       "",
+		DnsTxtResolversRaw: "",
 		Streaming:        false,
 		CountTotal:       false,
 		AutoConcurrency:  true,

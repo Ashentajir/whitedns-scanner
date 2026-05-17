@@ -6,6 +6,7 @@ type ScanResult struct {
 	Label      string
 	URL        string
 	ResolvedIP string // The actual IP address we connected to (DPI bypass)
+	DnsAnswer  string // TXT or DNS answer payload for DNS-oriented modes
 	Port       int    // The port scanned (e.g., 443, 8443, 80)
 	Status     int    // HTTP status code, 0 if it failed before finishing HTTP request
 	LatencyMs  int    // Total latency in milliseconds

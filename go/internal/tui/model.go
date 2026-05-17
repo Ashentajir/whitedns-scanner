@@ -60,6 +60,7 @@ type DnsDisplayEntry struct {
 	IsPoisoned bool
 	TTFB       int    // milliseconds
 	AnswerIP   string // First answer IP from the response
+	Answer     string // TXT answer or alternate DNS payload
 	Error      string // Non-empty if the probe failed
 }
 
@@ -85,11 +86,15 @@ type Model struct {
 
 	// DNS Discovery Mode state
 	dnsMode       bool
+	txtMode       bool
 	dnsResults    [128]DnsDisplayEntry
 	dnsIndex      int
 	dnsEntryCount int
 	dnsCleanCount int
 	dnsPoisoned   int
+	dnsHijacked   int
+
+	help bool
 
 	quitting bool
 	finished bool
@@ -104,6 +109,7 @@ func NewModel(cfg *engine.ScanConfig) *Model {
 		state:     "STARTING",
 		startTime: time.Now(),
 		dnsMode:   cfg.DnsDiscoveryMode,
+		txtMode:   cfg.DnsTxtMode,
 	}
 }
 
@@ -145,7 +151,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.engine.Stop()
 					return nil
 				},
-				tea.Quit,
 			)
 		case key.Matches(msg, m.keys.Pause):
 			return m, func() tea.Msg {
@@ -157,11 +162,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.engine.Resume()
 				return nil
 			}
+		case key.Matches(msg, m.keys.Help):
+			m.help = !m.help
+			return m, nil
 		}
 
 	case resultMsg:
 		if m.dnsMode {
 			m.handleDnsResult(msg.result)
+		} else if m.txtMode {
+			m.handleTxtResult(msg.result)
 		} else {
 			m.handleHttpResult(msg.result)
 		}
@@ -180,7 +190,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		if m.quitting {
-			return m, tea.Quit
+			return m, nil
 		}
 		return m, tickCmd()
 	}
@@ -211,24 +221,67 @@ func (m *Model) handleDnsResult(r *engine.ScanResult) {
 		return // Skip non-DNS results
 	}
 
-	if r.Error == "" && r.Status > 0 {
+	if r.Status > 0 {
 		m.openCount++
 		if r.IsPoisoned {
 			m.dnsPoisoned++
 		} else {
 			m.dnsCleanCount++
 		}
+		if isHijackedAnswer(r.ResolvedIP) {
+			m.dnsHijacked++
+		}
 	} else {
 		m.deadCount++
 	}
 
 	// Add to DNS display ring buffer
+	answer := r.ResolvedIP
+	if answer == "" {
+		answer = r.DnsAnswer
+	}
 	entry := DnsDisplayEntry{
 		ResolverIP: r.Label,
 		Protocol:   r.DnsProtocol,
 		IsPoisoned: r.IsPoisoned,
 		TTFB:       r.LatencyMs,
 		AnswerIP:   r.ResolvedIP,
+		Answer:     answer,
+		Error:      r.Error,
+	}
+
+	m.dnsResults[m.dnsIndex] = entry
+	m.dnsIndex++
+	if m.dnsIndex >= 128 {
+		m.dnsIndex = 0
+	}
+	if m.dnsEntryCount < 128 {
+		m.dnsEntryCount++
+	}
+}
+
+func (m *Model) handleTxtResult(r *engine.ScanResult) {
+	if r.DnsProtocol == "" {
+		return
+	}
+
+	if r.Error == "" {
+		m.openCount++
+	} else {
+		m.deadCount++
+	}
+
+	answer := r.DnsAnswer
+	if answer == "" {
+		answer = r.ResolvedIP
+	}
+
+	entry := DnsDisplayEntry{
+		ResolverIP: r.Label,
+		Protocol:   r.DnsProtocol,
+		TTFB:       r.LatencyMs,
+		AnswerIP:   r.ResolvedIP,
+		Answer:     answer,
 		Error:      r.Error,
 	}
 
@@ -244,9 +297,12 @@ func (m *Model) handleDnsResult(r *engine.ScanResult) {
 
 func (m *Model) View() string {
 	if m.quitting && m.finished {
+		if m.txtMode {
+			return fmt.Sprintf("\n  TXT probe complete! Answered: %d, Failed: %d\n", m.openCount, m.deadCount)
+		}
 		if m.dnsMode {
-			return fmt.Sprintf("\n  DNS Discovery complete! Clean: %d, Poisoned: %d, Failed: %d\n",
-				m.dnsCleanCount, m.dnsPoisoned, m.deadCount)
+			return fmt.Sprintf("\n  DNS Discovery complete! Clean: %d, Poisoned: %d, Hijacked: %d, Failed: %d\n",
+				m.dnsCleanCount, m.dnsPoisoned, m.dnsHijacked, m.deadCount)
 		}
 		return fmt.Sprintf("\n  Scan complete! Open: %d, Dead: %d\n", m.openCount, m.deadCount)
 	}
@@ -264,24 +320,32 @@ func (m *Model) View() string {
 	}
 	compact := m.height < 28 || frameWidth < 90
 
-	accent := lipgloss.Color("#9b30ff")
+	accent := lipgloss.Color("#7bdff2")
 	frameStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(accent).
 		Padding(1, 1)
 	sectionStyle := lipgloss.NewStyle().Padding(1, 0)
-	divider := lipgloss.NewStyle().Foreground(lipgloss.Color("#4b2a7a")).Render(strings.Repeat("─", innerWidth))
+	divider := lipgloss.NewStyle().Foreground(lipgloss.Color("#a7f3d0")).Render(strings.Repeat("─", innerWidth))
 	metricStyle := lipgloss.NewStyle().Padding(0, 1)
-	metricLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("#9a9a9a")).Bold(true)
+	metricLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("#cbd5e1")).Bold(true)
 	headerLine := titleStyle.Width(innerWidth).Render("WHITEDNS SCANNER")
-	subtitle := dimStyle.Width(innerWidth).Align(lipgloss.Center).Render("Professional network visibility dashboard")
+	subtitle := dimStyle.Width(innerWidth).Align(lipgloss.Center).Render("Interactive network scanner — live resolver & endpoint insights")
 	modeText := "HTTP SCAN"
 	if m.dnsMode {
 		modeText = "DNS DISCOVERY"
+	} else if m.txtMode {
+		modeText = "TXT RESOLVER PROBE"
 	}
-	modeBadge := pill(modeText, "#ffffff", "#4b2a7a")
+	modeBadge := pill(modeText, "#0b1020", "#7bdff2")
 	modeLine := lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Center).Render(modeBadge)
-	modeLabel := dimStyle.Width(innerWidth).Align(lipgloss.Center).Render("DNS MODE ACTIVE")
+	modeLabelText := "HTTP MODE ACTIVE"
+	if m.dnsMode {
+		modeLabelText = "DNS MODE ACTIVE"
+	} else if m.txtMode {
+		modeLabelText = "TXT MODE ACTIVE"
+	}
+	modeLabel := dimStyle.Width(innerWidth).Align(lipgloss.Center).Render(modeLabelText)
 	controls := renderControls(innerWidth)
 
 	progressPct := 0.0
@@ -325,14 +389,21 @@ func (m *Model) View() string {
 	footer := dimStyle.Width(innerWidth).Align(lipgloss.Right).Render("Developed by whisper the heaven & ashentajir")
 
 	parts := []string{headerLine}
-	if !compact {
-		parts = append(parts, subtitle)
+	if m.help {
+		// Show a compact help card when help mode is toggled
+		helpCard := m.renderHelp(innerWidth)
+		parts = append(parts, helpCard)
+		parts = append(parts, divider)
+	} else {
+		if !compact {
+			parts = append(parts, subtitle)
+		}
+		parts = append(parts, modeLabel, modeLine, controls, divider, progressCard, divider, metrics, divider)
+		if !compact || m.height > 22 {
+			parts = append(parts, activity, divider)
+		}
+		parts = append(parts, footer)
 	}
-	parts = append(parts, modeLabel, modeLine, controls, divider, progressCard, divider, metrics, divider)
-	if !compact || m.height > 22 {
-		parts = append(parts, activity, divider)
-	}
-	parts = append(parts, footer)
 
 	content := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
@@ -340,11 +411,22 @@ func (m *Model) View() string {
 }
 
 func renderControls(width int) string {
-	text := "P Pause  |  R Resume  |  Q Save & Quit"
-	if width < 62 {
-		text = "P Pause | R Resume | Q Save"
+	// Render interactive key badges with short labels
+	badge := func(k, label string) string {
+		return pill(k, "#0b1020", "#7bdff2") + " " + dimStyle.Render(label)
 	}
-	return dimStyle.Width(width).Align(lipgloss.Center).Render(text)
+
+	helpBadge := pill("H", "#0b1020", "#ffe066") + " " + dimStyle.Render("Help")
+
+	left := badge("P", "Pause") + "  " + badge("R", "Resume") + "  " + badge("Q", "Quit")
+	if width < 62 {
+		// Compact layout
+		left = badge("P", "P") + " " + badge("R", "R") + " " + badge("Q", "Q")
+	}
+	right := helpBadge
+	// Center combined controls
+	combined := lipgloss.JoinHorizontal(lipgloss.Center, left, lipgloss.NewStyle().Width(4).Render(""), right)
+	return dimStyle.Width(width).Align(lipgloss.Center).Render(combined)
 }
 
 func (m *Model) renderMetrics(width int, metricStyle lipgloss.Style, labelStyle lipgloss.Style) string {
@@ -360,15 +442,22 @@ func (m *Model) renderMetrics(width int, metricStyle lipgloss.Style, labelStyle 
 			{"Scanned", fmt.Sprintf("%d", m.done), deepPurple},
 			{"Clean", fmt.Sprintf("%d", m.dnsCleanCount), greenText},
 			{"Poisoned", fmt.Sprintf("%d", m.dnsPoisoned), magentaText},
-			{"Hijacked", fmt.Sprintf("%d", m.hijackedCount()), yellowText},
+			{"Hijacked", fmt.Sprintf("%d", m.dnsHijacked), yellowText},
 			{"Failed", fmt.Sprintf("%d", m.deadCount), redText},
+		}
+	} else if m.txtMode {
+		specs = []metricSpec{
+			{"Scanned", fmt.Sprintf("%d", m.done), deepPurple},
+			{"Answered", fmt.Sprintf("%d", m.openCount), greenText},
+			{"Failed", fmt.Sprintf("%d", m.deadCount), redText},
+			{"Records", fmt.Sprintf("%d", m.dnsEntryCount), cyanText},
 		}
 	} else {
 		specs = []metricSpec{
 			{"Scanned", fmt.Sprintf("%d", m.done), deepPurple},
 			{"Reachable", fmt.Sprintf("%d", m.openCount), greenText},
 			{"Failed", fmt.Sprintf("%d", m.deadCount), redText},
-			{"Alerts", fmt.Sprintf("%d", m.dnsPoisoned+m.hijackedCount()), magentaText},
+			{"Alerts", fmt.Sprintf("%d", m.dnsPoisoned+m.dnsHijacked), magentaText},
 		}
 	}
 
@@ -415,6 +504,15 @@ func (m *Model) renderActivitySection(width int, sectionStyle lipgloss.Style) st
 		body := renderListBody(rows, width)
 		return sectionStyle.Width(width).Render(dimStyle.Render("DNS activity") + "\n" + body)
 	}
+	if m.txtMode {
+		entries := m.latestDNSEntries(m.activityLimit())
+		rows := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			rows = append(rows, renderDNSEntryCompact(entry, width-4))
+		}
+		body := renderListBody(rows, width)
+		return sectionStyle.Width(width).Render(dimStyle.Render("TXT activity") + "\n" + body)
+	}
 
 	hits := m.latestHTTPHits(m.activityLimit())
 	rows := make([]string, 0, len(hits))
@@ -447,6 +545,17 @@ func renderListBody(rows []string, width int) string {
 		parts = append(parts, row)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+func (m *Model) renderHelp(width int) string {
+	lines := []string{
+		pill("P", "#0b1020", "#7bdff2") + "  " + dimStyle.Render("Pause scanning"),
+		pill("R", "#0b1020", "#7bdff2") + "  " + dimStyle.Render("Resume scanning"),
+		pill("Q", "#ffffff", "#ff6b6b") + "  " + dimStyle.Render("Quit & save results"),
+		pill("H", "#0b1020", "#ffe066") + "  " + dimStyle.Render("Toggle this help"),
+	}
+	body := strings.Join(lines, "\n")
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1, 1).Width(width).Render(body)
 }
 
 func renderHTTPHit(hit *engine.ScanResult, width int) string {
@@ -508,7 +617,7 @@ func renderDNSEntry(entry DnsDisplayEntry, width int) string {
 	protocol := protocolPill(entry.Protocol)
 	integrity := dnsIntegrityPill(entry)
 	stateBadge := dnsStateBadge(entry)
-	answer := entry.AnswerIP
+	answer := dnsDisplayAnswer(entry)
 	if answer == "" {
 		answer = entry.Error
 	}
@@ -546,7 +655,7 @@ func renderDNSEntryCompact(entry DnsDisplayEntry, width int) string {
 	proto := padRightPlain(truncateText(entry.Protocol, protoWidth), protoWidth)
 	state := padRightPlain(truncateText(dnsStateText(entry), stateWidth), stateWidth)
 	lat := padRightPlain(truncateText(fmt.Sprintf("%dms", entry.TTFB), latWidth), latWidth)
-	answer := entry.AnswerIP
+	answer := dnsDisplayAnswer(entry)
 	if answer == "" {
 		answer = entry.Error
 	}
@@ -605,6 +714,13 @@ func (m *Model) latestDNSEntries(limit int) []DnsDisplayEntry {
 	return result
 }
 
+func dnsDisplayAnswer(entry DnsDisplayEntry) string {
+	if entry.Answer != "" {
+		return entry.Answer
+	}
+	return entry.AnswerIP
+}
+
 func (m *Model) activityLimit() int {
 	if m.dnsMode {
 		return 2
@@ -624,23 +740,12 @@ func (m *Model) activityLimit() int {
 	return 6
 }
 
-func (m *Model) hijackedCount() int {
-	count := 0
-	for i := 0; i < m.dnsEntryCount; i++ {
-		idx := (m.dnsIndex - 1 - i + 128) % 128
-		entry := m.dnsResults[idx]
-		if entry.ResolverIP == "" || entry.AnswerIP == "" {
-			continue
-		}
-		ip := net.ParseIP(entry.AnswerIP)
-		if ip == nil {
-			continue
-		}
-		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
-			count++
-		}
+func isHijackedAnswer(answerIP string) bool {
+	ip := net.ParseIP(answerIP)
+	if ip == nil {
+		return false
 	}
-	return count
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified()
 }
 
 func renderProgressBar(width int, pct float64) string {

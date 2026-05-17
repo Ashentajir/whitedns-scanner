@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 
 	"reachability-scanner/engine"
@@ -20,8 +21,11 @@ func main() {
 	var retry int
 	var allPorts bool
 	var dnsMode bool
+	var txtMode bool
 	var portsFlag string
 	var dnsDomain string
+	var txtDomain string
+	var txtResolversRaw string
 	var spoofSNI string
 	var autoConcurrency bool
 	var minConcurrent int
@@ -38,8 +42,11 @@ func main() {
 	flag.IntVar(&retry, "retry", 2, "HTTP retry count")
 	flag.BoolVar(&allPorts, "allports", false, "Scan all 13 Cloudflare ports per host")
 	flag.BoolVar(&dnsMode, "dns", false, "DNS Discovery Mode: probe resolver IPs across UDP/TCP/DoT/DoH")
+	flag.BoolVar(&txtMode, "txt", false, "TXT Resolver Mode: probe resolvers with TXT lookups")
 	flag.StringVar(&portsFlag, "ports", "", "Custom ports (comma-separated or ranges, e.g. 80,443,8000-8010)")
 	flag.StringVar(&dnsDomain, "domain", "google.com", "Target domain for DNS integrity verification")
+	flag.StringVar(&txtDomain, "txtdomain", "", "Base domain for TXT resolver verification")
+	flag.StringVar(&txtResolversRaw, "resolvers", "", "Comma-separated resolver IPs for TXT mode")
 	flag.StringVar(&spoofSNI, "sni", "www.speedtest.net", "Spoofed SNI for DPI bypass (e.g. zula.ir)")
 	flag.BoolVar(&autoConcurrency, "autoconcurrency", true, "Auto-tune worker pool size")
 	flag.IntVar(&minConcurrent, "minconcurrency", 200, "Minimum workers when auto-tuning")
@@ -68,10 +75,18 @@ func main() {
 	cfg.RetryCount = retry
 	cfg.ScanAllPorts = allPorts
 	if portsFlag != "" {
-		cfg.CustomPorts = parsePortsString(portsFlag)
+		ports, err := parsePortsString(portsFlag)
+		if err != nil {
+			fmt.Printf("  Error: %v\n", err)
+			os.Exit(1)
+		}
+		cfg.CustomPorts = ports
 	}
 	cfg.DnsDiscoveryMode = dnsMode
 	cfg.TargetDomain = dnsDomain
+	cfg.DnsTxtMode = txtMode
+	cfg.DnsTxtDomain = txtDomain
+	cfg.DnsTxtResolversRaw = txtResolversRaw
 	cfg.SpoofedSNI = spoofSNI
 
 	interactive := len(os.Args) == 1
@@ -81,13 +96,18 @@ func main() {
 			runInteractiveSetup(cfg)
 		}
 
-		// Validate input file exists
-		if _, err := os.Stat(cfg.InputFile); os.IsNotExist(err) {
-			fmt.Printf("  Error: Could not find target file '%s'\n", cfg.InputFile)
-			if !interactive {
-				os.Exit(1)
+		runScan := true
+		needsInputFile := !cfg.DnsTxtMode || strings.TrimSpace(cfg.DnsTxtResolversRaw) == ""
+		if needsInputFile {
+			if _, err := os.Stat(cfg.InputFile); os.IsNotExist(err) {
+				fmt.Printf("  Error: Could not find target file '%s'\n", cfg.InputFile)
+				if !interactive {
+					os.Exit(1)
+				}
+				runScan = false
 			}
-		} else {
+		}
+		if runScan {
 			// Run the TUI Model
 			model := tui.NewModel(cfg)
 			if err := model.Run(cfg); err != nil {
@@ -131,7 +151,7 @@ func main() {
 
 func runInteractiveSetup(cfg *engine.ScanConfig) {
 	fmt.Println("\n╔══════════════════════════════════════════════════════╗")
-	fmt.Println("║     ENTERPRISE REACHABILITY SCANNER - Setup         ║")
+	fmt.Println("║    WHITEDNS SCANNER - Setup         ║")
 	fmt.Println("╚══════════════════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -171,10 +191,13 @@ func runInteractiveSetup(cfg *engine.ScanConfig) {
 	fmt.Println("    [3] DNS Resolver Discovery — Probe resolvers (UDP/TCP/DoT/DoH)")
 	fmt.Println("    [4] DNS UDP/TCP only — faster, no DoT/DoH")
 	fmt.Println("    [5] Custom ports — enter a list or ranges (e.g. 80,443,8000-8010)")
+	fmt.Println("    [6] TXT Resolver Probe — query TXT on a user domain")
 
 	defaultMode := "1"
 	if cfg.DnsDiscoveryMode {
 		defaultMode = "3"
+	} else if cfg.DnsTxtMode {
+		defaultMode = "6"
 	} else if cfg.ScanAllPorts {
 		defaultMode = "2"
 	}
@@ -191,15 +214,24 @@ func runInteractiveSetup(cfg *engine.ScanConfig) {
 	case "1":
 		cfg.ScanAllPorts = false
 		cfg.DnsDiscoveryMode = false
+		cfg.DnsTxtMode = false
 		cfg.DnsUdpTcpOnly = false
+		cfg.DnsTxtResolversRaw = ""
+		cfg.CustomPorts = nil
 	case "2":
 		cfg.ScanAllPorts = true
 		cfg.DnsDiscoveryMode = false
+		cfg.DnsTxtMode = false
 		cfg.DnsUdpTcpOnly = false
+		cfg.DnsTxtResolversRaw = ""
+		cfg.CustomPorts = nil
 	case "3":
 		cfg.ScanAllPorts = false
 		cfg.DnsDiscoveryMode = true
+		cfg.DnsTxtMode = false
 		cfg.DnsUdpTcpOnly = false
+		cfg.DnsTxtResolversRaw = ""
+		cfg.CustomPorts = nil
 		fmt.Printf("  Enter integrity check domain (Default: %s): ", cfg.TargetDomain)
 		var domainInput string
 		fmt.Scanln(&domainInput)
@@ -210,7 +242,10 @@ func runInteractiveSetup(cfg *engine.ScanConfig) {
 	case "4":
 		cfg.ScanAllPorts = false
 		cfg.DnsDiscoveryMode = true
+		cfg.DnsTxtMode = false
 		cfg.DnsUdpTcpOnly = true
+		cfg.DnsTxtResolversRaw = ""
+		cfg.CustomPorts = nil
 		fmt.Printf("  Enter integrity check domain (Default: %s): ", cfg.TargetDomain)
 		var domainInput2 string
 		fmt.Scanln(&domainInput2)
@@ -219,6 +254,8 @@ func runInteractiveSetup(cfg *engine.ScanConfig) {
 			cfg.TargetDomain = domainInput2
 		}
 	case "5":
+		cfg.DnsTxtMode = false
+		cfg.DnsTxtResolversRaw = ""
 		// Custom ports - apply to non-DNS scans. If DNS mode is wanted, user should
 		// select 3 or 4 above and then also enter custom ports using flag or prompt.
 		fmt.Printf("  Enter custom ports (e.g. 80,443,8000-8010): ")
@@ -226,12 +263,52 @@ func runInteractiveSetup(cfg *engine.ScanConfig) {
 		fmt.Scanln(&portsInput)
 		portsInput = strings.TrimSpace(portsInput)
 		if portsInput != "" {
-			cfg.CustomPorts = parsePortsString(portsInput)
+			ports, err := parsePortsString(portsInput)
+			if err != nil {
+				fmt.Printf("  Error: %v\n", err)
+			} else {
+				cfg.CustomPorts = ports
+			}
+		}
+	case "6":
+		cfg.ScanAllPorts = false
+		cfg.DnsDiscoveryMode = false
+		cfg.DnsTxtMode = true
+		cfg.DnsUdpTcpOnly = false
+		cfg.CustomPorts = nil
+		if strings.TrimSpace(cfg.DnsTxtDomain) == "" {
+			fmt.Printf("  Enter TXT base domain: ")
+		} else {
+			fmt.Printf("  Enter TXT base domain (Default: %s): ", cfg.DnsTxtDomain)
+		}
+		var txtDomainInput string
+		fmt.Scanln(&txtDomainInput)
+		txtDomainInput = strings.TrimSpace(txtDomainInput)
+		if txtDomainInput != "" {
+			cfg.DnsTxtDomain = txtDomainInput
+		}
+
+		fmt.Println("  Resolver source:")
+		fmt.Println("    [1] Use resolver file from input path")
+		fmt.Println("    [2] Write/paste resolvers inline (comma-separated)")
+		fmt.Printf("  Select source (Default: 1): ")
+		var resolverSource string
+		fmt.Scanln(&resolverSource)
+		resolverSource = strings.TrimSpace(resolverSource)
+		if resolverSource == "2" {
+			fmt.Printf("  Enter resolvers (comma-separated): ")
+			var resolverInput string
+			fmt.Scanln(&resolverInput)
+			cfg.DnsTxtResolversRaw = strings.TrimSpace(resolverInput)
+		} else {
+			cfg.DnsTxtResolversRaw = ""
 		}
 	}
 
 	fmt.Println()
-	if cfg.DnsDiscoveryMode {
+	if cfg.DnsTxtMode {
+		fmt.Printf("  ⚡ Mode: TXT RESOLVER PROBE (domain: %s)\n", cfg.DnsTxtDomain)
+	} else if cfg.DnsDiscoveryMode {
 		fmt.Printf("  ⚡ Mode: DNS RESOLVER DISCOVERY (domain: %s)\n", cfg.TargetDomain)
 	} else if cfg.ScanAllPorts {
 		fmt.Println("  ⚡ Mode: ALL CLOUDFLARE PORTS (13 per host)")
@@ -254,8 +331,9 @@ func openDir(dir string) {
 	}
 }
 
-// parsePortsString accepts comma-separated ports and ranges like 8000-8010
-func parsePortsString(s string) []int {
+// parsePortsString accepts comma-separated ports and ranges like 8000-8010.
+// It rejects malformed input instead of silently turning it into a wrong scan.
+func parsePortsString(s string) ([]int, error) {
 	out := make(map[int]struct{})
 	parts := strings.Split(s, ",")
 	for _, p := range parts {
@@ -265,10 +343,17 @@ func parsePortsString(s string) []int {
 		}
 		if strings.Contains(p, "-") {
 			bounds := strings.SplitN(p, "-", 2)
-			a := 0
-			b := 0
-			fmt.Sscanf(bounds[0], "%d", &a)
-			fmt.Sscanf(bounds[1], "%d", &b)
+			if len(bounds) != 2 || strings.TrimSpace(bounds[0]) == "" || strings.TrimSpace(bounds[1]) == "" {
+				return nil, fmt.Errorf("invalid port range %q", p)
+			}
+			a, err := strconv.Atoi(strings.TrimSpace(bounds[0]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid port range %q", p)
+			}
+			b, err := strconv.Atoi(strings.TrimSpace(bounds[1]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid port range %q", p)
+			}
 			if a > b {
 				a, b = b, a
 			}
@@ -278,10 +363,14 @@ func parsePortsString(s string) []int {
 				}
 			}
 		} else {
-			v := 0
-			fmt.Sscanf(p, "%d", &v)
+			v, err := strconv.Atoi(p)
+			if err != nil {
+				return nil, fmt.Errorf("invalid port %q", p)
+			}
 			if v >= 1 && v <= 65535 {
 				out[v] = struct{}{}
+			} else {
+				return nil, fmt.Errorf("port out of range %q", p)
 			}
 		}
 	}
@@ -291,5 +380,5 @@ func parsePortsString(s string) []int {
 	}
 	// sort for deterministic order
 	sort.Ints(res)
-	return res
+	return res, nil
 }

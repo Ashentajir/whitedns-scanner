@@ -29,6 +29,7 @@ type DnsProbeResult struct {
 	Responded  bool          // Did we get a parseable DNS response?
 	IsPoisoned bool          // Did the answer IPs mismatch the truth table?
 	AnswerIPs  []string      // A-record IPs extracted from the response
+	AnswerTXT  []string      // TXT strings extracted from the response
 	TTFB       time.Duration // Time to first byte of the DNS response
 	Error      string        // Human-readable error, empty on success
 }
@@ -185,7 +186,7 @@ func (t *TruthTable) Verify(ips []string) bool {
 // buildDnsQuery constructs a raw DNS A-record query for the given domain.
 // Returns the wire-format bytes and the randomized transaction ID.
 // Uses crypto/rand for TXID to evade pattern-based DPI blocking.
-func buildDnsQuery(domain string) ([]byte, uint16) {
+func buildDnsQuery(domain string, qtype uint16) ([]byte, uint16) {
 	// Generate cryptographically random transaction ID
 	var txidBytes [2]byte
 	_, _ = rand.Read(txidBytes[:])
@@ -206,7 +207,7 @@ func buildDnsQuery(domain string) ([]byte, uint16) {
 	question := encodeDomainName(domain)
 
 	// QTYPE: A (1), QCLASS: IN (1)
-	question = append(question, 0x00, 0x01) // Type A
+	question = append(question, byte(qtype>>8), byte(qtype))
 	question = append(question, 0x00, 0x01) // Class IN
 
 	packet := append(header, question...)
@@ -228,7 +229,7 @@ func encodeDomainName(domain string) []byte {
 
 // parseDnsResponse extracts A-record IPs from a raw DNS response packet.
 // Handles pointer compression in the answer section.
-func parseDnsResponse(packet []byte) ([]string, error) {
+func parseDnsResponse(packet []byte, qtype uint16) ([]string, error) {
 	if len(packet) < 12 {
 		return nil, fmt.Errorf("packet too short: %d bytes", len(packet))
 	}
@@ -282,22 +283,59 @@ func parseDnsResponse(packet []byte) ([]string, error) {
 			break
 		}
 
-		// Type A (1) with 4-byte RDATA = IPv4 address
-		if aType == 1 && rdLength == 4 {
-			ip := fmt.Sprintf("%d.%d.%d.%d",
-				packet[offset], packet[offset+1],
-				packet[offset+2], packet[offset+3])
-			ips = append(ips, ip)
+		if aType == qtype {
+			switch qtype {
+			case 1:
+				if rdLength == 4 {
+					ip := fmt.Sprintf("%d.%d.%d.%d",
+						packet[offset], packet[offset+1],
+						packet[offset+2], packet[offset+3])
+					ips = append(ips, ip)
+				}
+			case 16:
+				if txt, err := parseTxtRData(packet[offset : offset+int(rdLength)]); err == nil && txt != "" {
+					ips = append(ips, txt)
+				}
+			}
 		}
 
 		offset += int(rdLength)
 	}
 
 	if len(ips) == 0 {
-		return nil, fmt.Errorf("no A records in response")
+		return nil, fmt.Errorf("no %s records in response", dnsQueryTypeName(qtype))
 	}
 
 	return ips, nil
+}
+
+func parseTxtRData(data []byte) (string, error) {
+	if len(data) == 0 {
+		return "", fmt.Errorf("empty TXT record")
+	}
+
+	parts := make([]string, 0, 4)
+	for offset := 0; offset < len(data); {
+		length := int(data[offset])
+		offset++
+		if offset+length > len(data) {
+			return "", fmt.Errorf("malformed TXT record")
+		}
+		parts = append(parts, string(data[offset:offset+length]))
+		offset += length
+	}
+	return strings.Join(parts, ""), nil
+}
+
+func dnsQueryTypeName(qtype uint16) string {
+	switch qtype {
+	case 1:
+		return "A"
+	case 16:
+		return "TXT"
+	default:
+		return fmt.Sprintf("TYPE_%d", qtype)
+	}
 }
 
 // skipDnsName advances past a DNS domain name at the given offset,
@@ -343,7 +381,7 @@ func skipDnsName(packet []byte, offset int) int {
 func DnsProbeUDPWithDialer(ctx context.Context, resolverIP string, domain string, truth *TruthTable, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("UDP/%d", port)}
 
-	query, _ := buildDnsQuery(domain)
+	query, _ := buildDnsQuery(domain, 1)
 
 	addr := net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port))
 	if dialer == nil {
@@ -373,7 +411,7 @@ func DnsProbeUDPWithDialer(ctx context.Context, resolverIP string, domain string
 		return result
 	}
 
-	ips, err := parseDnsResponse(buf[:n])
+	ips, err := parseDnsResponse(buf[:n], 1)
 	if err != nil {
 		result.Error = "UDP_PARSE: " + err.Error()
 		return result
@@ -392,7 +430,7 @@ func DnsProbeUDPWithDialer(ctx context.Context, resolverIP string, domain string
 func DnsProbeTCPWithDialer(ctx context.Context, resolverIP string, domain string, truth *TruthTable, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("TCP/%d", port)}
 
-	query, _ := buildDnsQuery(domain)
+	query, _ := buildDnsQuery(domain, 1)
 
 	addr := net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port))
 	if dialer == nil {
@@ -437,7 +475,7 @@ func DnsProbeTCPWithDialer(ctx context.Context, resolverIP string, domain string
 		return result
 	}
 
-	ips, err := parseDnsResponse(respBuf)
+	ips, err := parseDnsResponse(respBuf, 1)
 	if err != nil {
 		result.Error = "TCP_PARSE: " + err.Error()
 		return result
@@ -455,7 +493,7 @@ func DnsProbeTCPWithDialer(ctx context.Context, resolverIP string, domain string
 func DnsProbeDoTWithDialer(ctx context.Context, resolverIP string, domain string, truth *TruthTable, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("DoT/%d", port)}
 
-	query, _ := buildDnsQuery(domain)
+	query, _ := buildDnsQuery(domain, 1)
 
 	addr := net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port))
 	if dialer == nil {
@@ -502,7 +540,7 @@ func DnsProbeDoTWithDialer(ctx context.Context, resolverIP string, domain string
 		return result
 	}
 
-	ips, err := parseDnsResponse(respBuf)
+	ips, err := parseDnsResponse(respBuf, 1)
 	if err != nil {
 		result.Error = "DoT_PARSE: " + err.Error()
 		return result

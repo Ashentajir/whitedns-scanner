@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -60,11 +61,25 @@ func (e *Engine) Start() {
 
 	cachePath := filepath.Join(e.config.OutputDir, e.config.CacheFile)
 	inputPath := filepath.Join(e.config.OutputDir, e.config.InputFile)
+	if e.config.DnsTxtMode {
+		txtTargets, err := loadTxtResolverTargets(inputPath, e.config.DnsTxtResolversRaw)
+		if err != nil {
+			e.handler.OnStateChange(fmt.Sprintf("FATAL: TXT Resolver Parse Err: %v", err))
+			return
+		}
+		if len(txtTargets) == 0 {
+			e.handler.OnStateChange("FATAL: TXT Resolver list is empty")
+			return
+		}
+		e.totalCount = len(txtTargets) * dnsProgressUnitsPerResolver(e.config)
+		e.startDnsTxtMode(ctx, txtTargets)
+		return
+	}
 	prioritized, _ := LoadCache(cachePath, false) // cache is never expanded to all ports
 
 	streamingEnabled := e.config.Streaming
 	if e.config.StreamingAuto {
-		large, _, err := IsLargeInput(inputPath, e.config.StreamingThreshold, e.config.StreamingSizeMB)
+		large, _, err := IsLargeInput(inputPath, e.config.ScanAllPorts, e.config.CustomPorts, e.config.DnsDiscoveryMode, e.config.StreamingThreshold, e.config.StreamingSizeMB)
 		if err == nil && large {
 			streamingEnabled = true
 		}
@@ -76,6 +91,7 @@ func (e *Engine) Start() {
 			inputPath,
 			e.config.ScanAllPorts,
 			e.config.CustomPorts,
+			e.config.DnsDiscoveryMode,
 		)
 		if err != nil {
 			e.handler.OnStateChange(fmt.Sprintf("FATAL: Target Parse Err: %v", err))
@@ -144,22 +160,24 @@ func (e *Engine) Start() {
 	// If streaming ingestion is enabled, prefer streaming path to avoid
 	// loading the entire target list in memory (helps with very large lists).
 	if streamingEnabled {
-		streamCh, count, err := StreamTargets(inputPath, e.config.ScanAllPorts, e.config.CustomPorts, e.config.CountTotal)
+		streamCh, _, err := StreamTargets(inputPath, e.config.ScanAllPorts, e.config.CustomPorts, false, e.config.DnsDiscoveryMode)
 		if err != nil {
 			e.handler.OnStateChange(fmt.Sprintf("FATAL: Target Stream Err: %v", err))
 			return
 		}
 		streamCh = prependAndFilterStream(prioritized, streamCh)
-		if count > 0 {
-			e.totalCount = count + len(prioritized)
-		} else {
-			e.totalCount = 0
+		if e.totalCount <= 0 {
+			if total, err := CountUniqueScannableTargetsWithSeed(inputPath, prioritized, e.config.ScanAllPorts, e.config.CustomPorts, e.config.DnsDiscoveryMode); err == nil {
+				e.totalCount = total
+			} else {
+				e.totalCount = 0
+			}
 		}
 
 		// ── DNS Discovery Mode (streaming) ──
 		if e.config.DnsDiscoveryMode {
 			if e.totalCount > 0 {
-				e.totalCount = e.totalCount * 4
+				e.totalCount = e.totalCount * dnsProgressUnitsPerResolver(e.config)
 			}
 			e.startDnsDiscoveryStream(ctx, streamCh)
 			return
@@ -172,6 +190,7 @@ func (e *Engine) Start() {
 
 	// ── DNS Discovery Mode ──
 	if e.config.DnsDiscoveryMode {
+		e.totalCount = len(targets) * dnsProgressUnitsPerResolver(e.config)
 		e.startDnsDiscovery(ctx, targets)
 		return
 	}
@@ -205,8 +224,11 @@ func (e *Engine) startHttpScan(ctx context.Context, targets []Target) {
 	if bufSize > e.totalCount {
 		bufSize = e.totalCount
 	}
+	if bufSize < 16 {
+		bufSize = 16
+	}
 	jobs := make(chan Target, bufSize)
-	results := make(chan ScanResult, bufSize)
+	results := make(chan ScanResult, bufSize*4)
 
 	// Start workers
 	for i := 0; i < workers; i++ {
@@ -240,9 +262,9 @@ func (e *Engine) startDnsDiscovery(ctx context.Context, targets []Target) {
 		// Integrity Verification falls back implicitly.
 	}
 
-	// In DNS mode, each IP generates 4 results (one per protocol)
-	// Adjust total for progress tracking
-	e.totalCount = len(targets) * 4
+	// In DNS mode, each resolver emits 2 or 4 results depending on the
+	// configured protocol set.
+	e.totalCount = len(targets) * dnsProgressUnitsPerResolver(e.config)
 
 	workers := e.resolveWorkerCount(len(targets))
 	bufSize := workers * 8
@@ -253,7 +275,13 @@ func (e *Engine) startDnsDiscovery(ctx context.Context, targets []Target) {
 		bufSize = 16
 	}
 	jobs := make(chan Target, bufSize)
-	results := make(chan ScanResult, bufSize*4)
+	// Increase results buffer to handle multi-protocol bursts from each worker
+	// Each worker can emit up to 4 results per job, so buffer should be at least 4x job buffer
+	resultsBufSize := bufSize * 16
+	if resultsBufSize < 256 {
+		resultsBufSize = 256
+	}
+	results := make(chan ScanResult, resultsBufSize)
 
 	// Start DNS workers
 	for i := 0; i < workers; i++ {
@@ -274,6 +302,44 @@ func (e *Engine) startDnsDiscovery(ctx context.Context, targets []Target) {
 	}()
 
 	// Collect results
+	e.collectResults(ctx, results)
+}
+
+// startDnsTxtMode runs TXT resolver verification against the provided resolvers.
+func (e *Engine) startDnsTxtMode(ctx context.Context, targets []Target) {
+	e.totalCount = len(targets) * dnsProgressUnitsPerResolver(e.config)
+
+	workers := e.resolveWorkerCount(len(targets))
+	bufSize := workers * 8
+	if bufSize > len(targets) {
+		bufSize = len(targets)
+	}
+	if bufSize < 16 {
+		bufSize = 16
+	}
+	jobs := make(chan Target, bufSize)
+	resultsBufSize := bufSize * 16
+	if resultsBufSize < 256 {
+		resultsBufSize = 256
+	}
+	results := make(chan ScanResult, resultsBufSize)
+
+	for i := 0; i < workers; i++ {
+		e.wg.Add(1)
+		go e.dnsWorker(ctx, jobs, results, nil)
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, t := range targets {
+			select {
+			case jobs <- t:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	e.collectResults(ctx, results)
 }
 
@@ -303,18 +369,21 @@ func (e *Engine) collectResults(ctx context.Context, results chan ScanResult) {
 		//   HTTP Reachability Mode: successful iff Error is empty.
 		//   DNS Discovery Mode:     successful iff Error is empty AND the
 		//                           resolver is NOT poisoned.
-		// Any node with an Error OR that is Poisoned belongs in deadResults.
+		//   TXT Resolver Mode:      successful iff Error is empty.
+		// Poisoned DNS results are tracked separately so the summary/report counts
+		// do not double count them as both dead and poisoned.
 		isSuccess := res.Error == ""
-		if e.config.DnsDiscoveryMode {
+		if e.config.DnsDiscoveryMode && !e.config.DnsTxtMode {
 			isSuccess = isSuccess && !res.IsPoisoned
 		}
 
 		if isSuccess {
 			openResults = append(openResults, res)
 		} else {
-			deadResults = append(deadResults, res)
-			if e.config.DnsDiscoveryMode && res.IsPoisoned {
+			if e.config.DnsDiscoveryMode && !e.config.DnsTxtMode && res.IsPoisoned {
 				poisonedResults = append(poisonedResults, res)
+			} else {
+				deadResults = append(deadResults, res)
 			}
 		}
 	}
@@ -330,10 +399,36 @@ func (e *Engine) collectResults(ctx context.Context, results chan ScanResult) {
 	poisonedPath := fmt.Sprintf("poisoned_dns_%s.txt", timestamp)
 	hijackedPath := fmt.Sprintf("hijacked_dns_%s.txt", timestamp)
 	rawIPPath := fmt.Sprintf("raw_ip_dump_%s.txt", timestamp)
+	debugPath := fmt.Sprintf("debug_count_%s.txt", timestamp)
 
-	WriteReports(e.config.OutputDir, openPath, fullPath, poisonedPath, hijackedPath, rawIPPath, e.config.CacheFile, openResults, deadResults, poisonedResults, e.totalCount)
+	// Write debug counts
+	debugFile := filepath.Join(e.config.OutputDir, debugPath)
+	if f, err := os.Create(debugFile); err == nil {
+		debugStr := fmt.Sprintf("Scan Results Debug Count\nGenerated: %s\n\n"+
+			"Expected Total (totalCount): %d\n"+
+			"Actually Collected: %d\n"+
+			"  - Open Results: %d\n"+
+			"  - Dead Results: %d\n"+
+			"  - Poisoned Results: %d\n"+
+			"  - Total Accounted: %d\n",
+			time.Now().Format("2006-01-02 15:04:05"),
+			e.totalCount,
+			doneCount,
+			len(openResults),
+			len(deadResults),
+			len(poisonedResults),
+			len(openResults)+len(deadResults)+len(poisonedResults),
+		)
+		f.WriteString(debugStr)
+		f.Close()
+	}
 
-	e.handler.OnComplete(len(openResults), len(deadResults), e.totalCount)
+	if err := WriteReports(e.config.OutputDir, openPath, fullPath, poisonedPath, hijackedPath, rawIPPath, e.config.CacheFile, openResults, deadResults, poisonedResults, e.totalCount); err != nil {
+		e.handler.OnStateChange(fmt.Sprintf("ERROR: Report write failed: %v", err))
+	}
+
+	deadCount := len(deadResults)
+	e.handler.OnComplete(len(openResults), deadCount, e.totalCount)
 }
 
 // Pause puts the engine in a paused state.
@@ -388,8 +483,11 @@ func (e *Engine) startHttpScanStream(ctx context.Context, stream <-chan Target) 
 	// Use a bounded job buffer — avoid allocating a channel the size of all targets
 	workers := e.resolveWorkerCount(0)
 	bufSize := workers * 8
+	if bufSize < 16 {
+		bufSize = 16
+	}
 	jobs := make(chan Target, bufSize)
-	results := make(chan ScanResult, bufSize)
+	results := make(chan ScanResult, bufSize*4)
 
 	// Start workers
 	for i := 0; i < workers; i++ {
@@ -428,7 +526,12 @@ func (e *Engine) startDnsDiscoveryStream(ctx context.Context, stream <-chan Targ
 		bufSize = 16
 	}
 	jobs := make(chan Target, bufSize)
-	results := make(chan ScanResult, bufSize*4)
+	// Increase results buffer for multi-protocol DNS results
+	resultsBufSize := bufSize * 16
+	if resultsBufSize < 256 {
+		resultsBufSize = 256
+	}
+	results := make(chan ScanResult, resultsBufSize)
 
 	for i := 0; i < workers; i++ {
 		e.wg.Add(1)
@@ -468,6 +571,7 @@ func prependAndFilterStream(prioritized []Target, stream <-chan Target) <-chan T
 			if _, ok := seen[t.URL]; ok {
 				continue
 			}
+			seen[t.URL] = struct{}{}
 			out <- t
 		}
 	}()
@@ -502,6 +606,35 @@ func (e *Engine) resolveWorkerCount(targetCount int) int {
 		workers = 1
 	}
 	return workers
+}
+
+// dnsProgressUnitsPerResolver returns the number of progress events emitted
+// per resolver in DNS discovery mode for the current configuration.
+func dnsProgressUnitsPerResolver(cfg *ScanConfig) int {
+	if cfg == nil {
+		return 4
+	}
+	if cfg.DnsTxtMode {
+		return 4
+	}
+	if len(cfg.CustomPorts) > 0 {
+		units := len(cfg.CustomPorts) * 2
+		if !cfg.DnsUdpTcpOnly {
+			for _, port := range cfg.CustomPorts {
+				if port == 853 {
+					units++
+				}
+				if port == 443 {
+					units++
+				}
+			}
+		}
+		return units
+	}
+	if cfg.DnsUdpTcpOnly {
+		return 2
+	}
+	return 4
 }
 
 // State returns the current engine state.
