@@ -32,6 +32,70 @@ type DnsProbeResult struct {
 	AnswerTXT  []string      // TXT strings extracted from the response
 	TTFB       time.Duration // Time to first byte of the DNS response
 	Error      string        // Human-readable error, empty on success
+
+	// Header holds the parsed DNS response header (all flags + section counts).
+	// HeaderOK reports whether the header was successfully parsed.
+	Header   DnsHeader
+	HeaderOK bool
+	// EDNS is true when the resolver echoed an EDNS0 OPT record, signalling it
+	// accepts large UDP payloads — a prerequisite for high-bandwidth tunneling.
+	EDNS bool
+}
+
+// DnsHeader is the fully-decoded 12-byte DNS message header (RFC 1035 §4.1.1).
+// Exposed so callers can inspect every flag — not just the answer records —
+// which is what the "full header dump" output and tunnel classifier rely on.
+type DnsHeader struct {
+	ID      uint16 // Transaction ID
+	QR      bool   // Query (false) / Response (true)
+	Opcode  uint8  // 0=QUERY, 1=IQUERY, 2=STATUS
+	AA      bool   // Authoritative Answer
+	TC      bool   // TrunCation — answer did not fit, retry over TCP
+	RD      bool   // Recursion Desired (what we asked for)
+	RA      bool   // Recursion Available — resolver is an open recursor
+	Z       uint8  // Reserved (3 bits)
+	Rcode   uint8  // Response code (0=NOERROR, 2=SERVFAIL, 3=NXDOMAIN, 5=REFUSED)
+	QDCount uint16 // Questions
+	ANCount uint16 // Answer records
+	NSCount uint16 // Authority records
+	ARCount uint16 // Additional records
+}
+
+// parseDnsHeader decodes the fixed 12-byte header at the start of a DNS message.
+func parseDnsHeader(packet []byte) (DnsHeader, error) {
+	if len(packet) < 12 {
+		return DnsHeader{}, fmt.Errorf("packet too short for header: %d bytes", len(packet))
+	}
+	flags := binary.BigEndian.Uint16(packet[2:4])
+	return DnsHeader{
+		ID:      binary.BigEndian.Uint16(packet[0:2]),
+		QR:      flags&0x8000 != 0,
+		Opcode:  uint8((flags >> 11) & 0x0F),
+		AA:      flags&0x0400 != 0,
+		TC:      flags&0x0200 != 0,
+		RD:      flags&0x0100 != 0,
+		RA:      flags&0x0080 != 0,
+		Z:       uint8((flags >> 4) & 0x07),
+		Rcode:   uint8(flags & 0x0F),
+		QDCount: binary.BigEndian.Uint16(packet[4:6]),
+		ANCount: binary.BigEndian.Uint16(packet[6:8]),
+		NSCount: binary.BigEndian.Uint16(packet[8:10]),
+		ARCount: binary.BigEndian.Uint16(packet[10:12]),
+	}, nil
+}
+
+// String renders the header as a compact single-line dump for reports, e.g.
+// "id=0x1a2b QR AA=0 TC=0 RD RA rcode=0 qd=1 an=2 ns=0 ar=1".
+func (h DnsHeader) String() string {
+	b := func(v bool) int {
+		if v {
+			return 1
+		}
+		return 0
+	}
+	return fmt.Sprintf("id=0x%04x qr=%d op=%d aa=%d tc=%d rd=%d ra=%d z=%d rcode=%d qd=%d an=%d ns=%d ar=%d",
+		h.ID, b(h.QR), h.Opcode, b(h.AA), b(h.TC), b(h.RD), b(h.RA), h.Z, h.Rcode,
+		h.QDCount, h.ANCount, h.NSCount, h.ARCount)
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -55,7 +119,10 @@ var trustedProviders = []trustedDoHProvider{
 // dohJSONResponse models the JSON wire format returned by DoH providers
 // when queried with Accept: application/dns-json.
 type dohJSONResponse struct {
-	Status int `json:"Status"`
+	Status int  `json:"Status"`
+	TC     bool `json:"TC"` // Truncated
+	RD     bool `json:"RD"` // Recursion Desired
+	RA     bool `json:"RA"` // Recursion Available — open recursor
 	Answer []struct {
 		Type int    `json:"type"`
 		Data string `json:"data"`
@@ -183,14 +250,26 @@ func (t *TruthTable) Verify(ips []string) bool {
 // DNS WIRE PROTOCOL — Manual Packet Construction (No External Dependencies)
 // ════════════════════════════════════════════════════════════════════════════════
 
-// buildDnsQuery constructs a raw DNS A-record query for the given domain.
+// ednsUDPPayloadSize is the advertised EDNS0 receive-buffer size. 4096 lets the
+// resolver return large answers in a single UDP datagram — both a robustness win
+// (fewer truncations) and the signal we use to gauge tunnel bandwidth.
+const ednsUDPPayloadSize = 4096
+
+// buildDnsQuery constructs a raw DNS query for the given domain and record type.
 // Returns the wire-format bytes and the randomized transaction ID.
-// Uses crypto/rand for TXID to evade pattern-based DPI blocking.
-func buildDnsQuery(domain string, qtype uint16) ([]byte, uint16) {
+// Uses crypto/rand for TXID to evade pattern-based DPI blocking AND to let the
+// caller validate that a response is genuinely ours (anti-spoofing). When edns
+// is true an EDNS0 OPT record is added so we can detect large-payload support.
+func buildDnsQuery(domain string, qtype uint16, edns bool) ([]byte, uint16) {
 	// Generate cryptographically random transaction ID
 	var txidBytes [2]byte
 	_, _ = rand.Read(txidBytes[:])
 	txid := binary.BigEndian.Uint16(txidBytes[:])
+
+	arCount := byte(0x00)
+	if edns {
+		arCount = 0x01
+	}
 
 	// DNS Header (12 bytes)
 	// Flags: 0x0100 = standard query, recursion desired (RD=1)
@@ -200,18 +279,37 @@ func buildDnsQuery(domain string, qtype uint16) ([]byte, uint16) {
 		0x00, 0x01, // QDCOUNT: 1 question
 		0x00, 0x00, // ANCOUNT: 0
 		0x00, 0x00, // NSCOUNT: 0
-		0x00, 0x00, // ARCOUNT: 0
+		0x00, arCount, // ARCOUNT: 1 if EDNS OPT appended, else 0
 	}
 
 	// DNS Question section — encode domain as labels
 	question := encodeDomainName(domain)
 
-	// QTYPE: A (1), QCLASS: IN (1)
+	// QTYPE, QCLASS: IN (1)
 	question = append(question, byte(qtype>>8), byte(qtype))
 	question = append(question, 0x00, 0x01) // Class IN
 
 	packet := append(header, question...)
+
+	if edns {
+		packet = append(packet, encodeEDNSOpt()...)
+	}
 	return packet, txid
+}
+
+// encodeEDNSOpt builds a minimal EDNS0 OPT pseudo-record (RFC 6891) for the
+// additional section: root name, TYPE=OPT(41), CLASS=UDP payload size, zeroed
+// extended-rcode/flags/version, and empty RDATA.
+func encodeEDNSOpt() []byte {
+	return []byte{
+		0x00,                                             // Root domain name
+		0x00, 0x29,                                       // TYPE: OPT (41)
+		byte(ednsUDPPayloadSize >> 8), byte(ednsUDPPayloadSize & 0xFF), // CLASS: UDP payload size
+		0x00,       // Extended RCODE
+		0x00,       // EDNS version 0
+		0x00, 0x00, // Z flags
+		0x00, 0x00, // RDLENGTH: 0
+	}
 }
 
 // encodeDomainName converts "google.com" into DNS wire format:
@@ -227,86 +325,95 @@ func encodeDomainName(domain string) []byte {
 	return buf
 }
 
-// parseDnsResponse extracts A-record IPs from a raw DNS response packet.
-// Handles pointer compression in the answer section.
-func parseDnsResponse(packet []byte, qtype uint16) ([]string, error) {
-	if len(packet) < 12 {
-		return nil, fmt.Errorf("packet too short: %d bytes", len(packet))
+// parseDnsMessage decodes a full DNS response: header, answer records of the
+// requested type, and whether an EDNS0 OPT record is present anywhere in the
+// message. It handles name-pointer compression and is bounds-checked throughout.
+//
+// When checkTxid is set the response ID must equal wantTxid, and the QR bit must
+// be set — this rejects blindly-spoofed / off-path injected packets that a
+// poisoning-detection scanner must not treat as genuine answers.
+func parseDnsMessage(packet []byte, qtype uint16, wantTxid uint16, checkTxid bool) (DnsHeader, []string, bool, error) {
+	hdr, err := parseDnsHeader(packet)
+	if err != nil {
+		return DnsHeader{}, nil, false, err
 	}
 
-	// Check RCODE in flags (lower 4 bits of byte 3)
-	rcode := packet[3] & 0x0F
-	if rcode != 0 {
-		return nil, fmt.Errorf("dns error rcode=%d", rcode)
+	if checkTxid && hdr.ID != wantTxid {
+		return hdr, nil, false, fmt.Errorf("txid mismatch got=0x%04x want=0x%04x", hdr.ID, wantTxid)
+	}
+	if !hdr.QR {
+		return hdr, nil, false, fmt.Errorf("not a response (QR=0)")
+	}
+	if hdr.Rcode != 0 {
+		return hdr, nil, false, fmt.Errorf("dns error rcode=%d", hdr.Rcode)
 	}
 
-	anCount := binary.BigEndian.Uint16(packet[6:8])
-	if anCount == 0 {
-		return nil, fmt.Errorf("no answer records")
-	}
-
-	// Skip header (12 bytes) and question section
 	offset := 12
 
-	// Skip question section: read QDCOUNT questions
-	qdCount := binary.BigEndian.Uint16(packet[4:6])
-	for i := 0; i < int(qdCount); i++ {
-		// Skip domain name
+	// Skip the question section.
+	for i := 0; i < int(hdr.QDCount); i++ {
 		offset = skipDnsName(packet, offset)
 		if offset < 0 || offset+4 > len(packet) {
-			return nil, fmt.Errorf("malformed question section")
+			return hdr, nil, false, fmt.Errorf("malformed question section")
 		}
-		offset += 4 // Skip QTYPE (2) + QCLASS (2)
+		offset += 4 // QTYPE (2) + QCLASS (2)
 	}
 
-	// Parse answer section
-	var ips []string
-	for i := 0; i < int(anCount); i++ {
+	// Walk every resource record (answer + authority + additional). We collect
+	// matching records from the answer section and note any OPT record (EDNS0)
+	// regardless of section.
+	var answers []string
+	edns := false
+	total := int(hdr.ANCount) + int(hdr.NSCount) + int(hdr.ARCount)
+	inAnswer := int(hdr.ANCount)
+
+	for i := 0; i < total; i++ {
 		if offset >= len(packet) {
 			break
 		}
-
-		// Skip answer name (could be a pointer)
 		offset = skipDnsName(packet, offset)
 		if offset < 0 || offset+10 > len(packet) {
 			break
 		}
 
-		aType := binary.BigEndian.Uint16(packet[offset : offset+2])
+		rType := binary.BigEndian.Uint16(packet[offset : offset+2])
 		offset += 2 // TYPE
-		offset += 2 // CLASS
-		offset += 4 // TTL
-		rdLength := binary.BigEndian.Uint16(packet[offset : offset+2])
+		offset += 2 // CLASS (OPT: UDP payload size — ignored here)
+		offset += 4 // TTL  (OPT: extended rcode/flags — ignored here)
+		rdLength := int(binary.BigEndian.Uint16(packet[offset : offset+2]))
 		offset += 2
 
-		if offset+int(rdLength) > len(packet) {
+		if offset+rdLength > len(packet) {
 			break
 		}
 
-		if aType == qtype {
+		if rType == 41 { // OPT pseudo-record => resolver understood our EDNS0 query
+			edns = true
+		}
+
+		if i < inAnswer && rType == qtype {
 			switch qtype {
 			case 1:
 				if rdLength == 4 {
-					ip := fmt.Sprintf("%d.%d.%d.%d",
+					answers = append(answers, fmt.Sprintf("%d.%d.%d.%d",
 						packet[offset], packet[offset+1],
-						packet[offset+2], packet[offset+3])
-					ips = append(ips, ip)
+						packet[offset+2], packet[offset+3]))
 				}
 			case 16:
-				if txt, err := parseTxtRData(packet[offset : offset+int(rdLength)]); err == nil && txt != "" {
-					ips = append(ips, txt)
+				if txt, err := parseTxtRData(packet[offset : offset+rdLength]); err == nil && txt != "" {
+					answers = append(answers, txt)
 				}
 			}
 		}
 
-		offset += int(rdLength)
+		offset += rdLength
 	}
 
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no %s records in response", dnsQueryTypeName(qtype))
+	if len(answers) == 0 {
+		return hdr, nil, edns, fmt.Errorf("no %s records in response", dnsQueryTypeName(qtype))
 	}
 
-	return ips, nil
+	return hdr, answers, edns, nil
 }
 
 func parseTxtRData(data []byte) (string, error) {
@@ -377,12 +484,32 @@ func skipDnsName(packet []byte, offset int) int {
 //   4. Parses the response and validates against the truth table
 // ════════════════════════════════════════════════════════════════════════════════
 
-// DnsProbeUDPWithDialer sends a plain DNS query over UDP on the specified port.
+// DnsProbeUDPWithDialer sends a DNS A query over UDP on the specified port.
 func DnsProbeUDPWithDialer(ctx context.Context, resolverIP string, domain string, truth *TruthTable, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("UDP/%d", port)}
 
-	query, _ := buildDnsQuery(domain, 1)
+	hdr, ips, edns, ttfb, err := probeUDPWithFallback(ctx, resolverIP, domain, 1, timeout, dialer, port)
+	result.TTFB = ttfb
+	if err != nil {
+		result.Error = "UDP: " + err.Error()
+		result.Header, result.HeaderOK = hdr, hdr.QR
+		return result
+	}
 
+	result.Responded = true
+	result.AnswerIPs = ips
+	result.Header, result.HeaderOK, result.EDNS = hdr, true, edns
+	result.IsPoisoned = !truth.Verify(ips)
+	return result
+}
+
+// probeUDPWithFallback dials the resolver and sends an EDNS0 query, then — if
+// that gets no usable answer — retries once with a bare (non-EDNS) query on the
+// same socket. This defeats censoring middleboxes that silently drop or FORMERR
+// EDNS traffic, so poisoned/broken resolvers are still observed rather than
+// timing out. Returns the response header, answers, whether EDNS0 is usable, the
+// time-to-first-byte, and an error if both attempts fail.
+func probeUDPWithFallback(ctx context.Context, resolverIP string, name string, qtype uint16, timeout time.Duration, dialer *net.Dialer, port int) (DnsHeader, []string, bool, time.Duration, error) {
 	addr := net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port))
 	if dialer == nil {
 		dialer = &net.Dialer{Timeout: timeout}
@@ -390,37 +517,54 @@ func DnsProbeUDPWithDialer(ctx context.Context, resolverIP string, domain string
 
 	conn, err := dialer.DialContext(ctx, "udp", addr)
 	if err != nil {
-		result.Error = "UDP_DIAL: " + truncErr(err)
-		return result
+		return DnsHeader{}, nil, false, 0, fmt.Errorf("DIAL: %s", truncErr(err))
 	}
 	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(timeout))
-
-	if _, err := conn.Write(query); err != nil {
-		result.Error = "UDP_WRITE: " + truncErr(err)
-		return result
+	var (
+		hdr     DnsHeader
+		ttfb    time.Duration
+		lastErr error
+	)
+	// EDNS0 first (large-payload detection); bare query second (compatibility).
+	for i, useEDNS := range []bool{true, false} {
+		query, txid := buildDnsQuery(name, qtype, useEDNS)
+		conn.SetDeadline(time.Now().Add(timeout))
+		if _, werr := conn.Write(query); werr != nil {
+			lastErr = fmt.Errorf("WRITE: %s", truncErr(werr))
+			continue
+		}
+		start := time.Now()
+		h, answers, edns, perr := readUDPResponse(conn, txid, qtype)
+		attemptTTFB := time.Since(start)
+		if i == 0 || ttfb == 0 {
+			ttfb = attemptTTFB
+		}
+		if perr == nil {
+			return h, answers, edns, attemptTTFB, nil
+		}
+		hdr, lastErr = h, fmt.Errorf("PARSE: %s", perr.Error())
 	}
+	return hdr, nil, false, ttfb, lastErr
+}
 
-	start := time.Now()
-	buf := make([]byte, 512)
-	n, err := conn.Read(buf)
-	result.TTFB = time.Since(start)
-	if err != nil {
-		result.Error = "UDP_READ: " + truncErr(err)
-		return result
+// readUDPResponse reads datagrams until one is a genuine response to our query
+// (matching TXID + QR set) or the connection deadline fires. Datagrams whose
+// TXID does not match ours are off-path spoofs / stragglers and are skipped —
+// this is the core anti-injection guard for hostile networks.
+func readUDPResponse(conn net.Conn, txid uint16, qtype uint16) (DnsHeader, []string, bool, error) {
+	buf := make([]byte, ednsUDPPayloadSize)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return DnsHeader{}, nil, false, err
+		}
+		hdr, answers, edns, perr := parseDnsMessage(buf[:n], qtype, txid, true)
+		if perr != nil && strings.Contains(perr.Error(), "txid mismatch") {
+			continue // not our answer — keep waiting for the real one
+		}
+		return hdr, answers, edns, perr
 	}
-
-	ips, err := parseDnsResponse(buf[:n], 1)
-	if err != nil {
-		result.Error = "UDP_PARSE: " + err.Error()
-		return result
-	}
-
-	result.Responded = true
-	result.AnswerIPs = ips
-	result.IsPoisoned = !truth.Verify(ips)
-	return result
 }
 
 // DnsProbeTCP sends a DNS query over TCP/53.
@@ -430,7 +574,7 @@ func DnsProbeUDPWithDialer(ctx context.Context, resolverIP string, domain string
 func DnsProbeTCPWithDialer(ctx context.Context, resolverIP string, domain string, truth *TruthTable, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("TCP/%d", port)}
 
-	query, _ := buildDnsQuery(domain, 1)
+	query, txid := buildDnsQuery(domain, 1, true)
 
 	addr := net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port))
 	if dialer == nil {
@@ -456,35 +600,43 @@ func DnsProbeTCPWithDialer(ctx context.Context, resolverIP string, domain string
 	}
 
 	start := time.Now()
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-		result.Error = "TCP_READ_LEN: " + truncErr(err)
-		return result
-	}
+	respBuf, err := readTCPResponse(conn)
 	result.TTFB = time.Since(start)
-
-	respLen := binary.BigEndian.Uint16(lenBuf[:])
-	if respLen == 0 || respLen > 4096 {
-		result.Error = fmt.Sprintf("TCP_BAD_LEN: %d", respLen)
+	if err != nil {
+		result.Error = "TCP_READ: " + truncErr(err)
 		return result
 	}
 
-	respBuf := make([]byte, respLen)
-	if _, err := io.ReadFull(conn, respBuf); err != nil {
-		result.Error = "TCP_READ_BODY: " + truncErr(err)
-		return result
-	}
-
-	ips, err := parseDnsResponse(respBuf, 1)
+	hdr, ips, edns, err := parseDnsMessage(respBuf, 1, txid, true)
 	if err != nil {
 		result.Error = "TCP_PARSE: " + err.Error()
+		result.Header, result.HeaderOK = hdr, hdr.QR
 		return result
 	}
 
 	result.Responded = true
 	result.AnswerIPs = ips
+	result.Header, result.HeaderOK, result.EDNS = hdr, true, edns
 	result.IsPoisoned = !truth.Verify(ips)
 	return result
+}
+
+// readTCPResponse reads one length-prefixed DNS message from a stream
+// (TCP/53 or a DoT tunnel). The 2-byte big-endian prefix bounds the body.
+func readTCPResponse(conn net.Conn) ([]byte, error) {
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	respLen := binary.BigEndian.Uint16(lenBuf[:])
+	if respLen == 0 || respLen > ednsUDPPayloadSize {
+		return nil, fmt.Errorf("bad length %d", respLen)
+	}
+	respBuf := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, respBuf); err != nil {
+		return nil, err
+	}
+	return respBuf, nil
 }
 
 // DnsProbeDoT sends a DNS query over DNS-over-TLS (port 853).
@@ -493,7 +645,7 @@ func DnsProbeTCPWithDialer(ctx context.Context, resolverIP string, domain string
 func DnsProbeDoTWithDialer(ctx context.Context, resolverIP string, domain string, truth *TruthTable, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("DoT/%d", port)}
 
-	query, _ := buildDnsQuery(domain, 1)
+	query, txid := buildDnsQuery(domain, 1, true)
 
 	addr := net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port))
 	if dialer == nil {
@@ -521,33 +673,23 @@ func DnsProbeDoTWithDialer(ctx context.Context, resolverIP string, domain string
 	}
 
 	start := time.Now()
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(tlsConn, lenBuf[:]); err != nil {
-		result.Error = "DoT_READ_LEN: " + truncErr(err)
-		return result
-	}
+	respBuf, err := readTCPResponse(tlsConn)
 	result.TTFB = time.Since(start)
-
-	respLen := binary.BigEndian.Uint16(lenBuf[:])
-	if respLen == 0 || respLen > 4096 {
-		result.Error = fmt.Sprintf("DoT_BAD_LEN: %d", respLen)
+	if err != nil {
+		result.Error = "DoT_READ: " + truncErr(err)
 		return result
 	}
 
-	respBuf := make([]byte, respLen)
-	if _, err := io.ReadFull(tlsConn, respBuf); err != nil {
-		result.Error = "DoT_READ_BODY: " + truncErr(err)
-		return result
-	}
-
-	ips, err := parseDnsResponse(respBuf, 1)
+	hdr, ips, edns, err := parseDnsMessage(respBuf, 1, txid, true)
 	if err != nil {
 		result.Error = "DoT_PARSE: " + err.Error()
+		result.Header, result.HeaderOK = hdr, hdr.QR
 		return result
 	}
 
 	result.Responded = true
 	result.AnswerIPs = ips
+	result.Header, result.HeaderOK, result.EDNS = hdr, true, edns
 	result.IsPoisoned = !truth.Verify(ips)
 	return result
 }
@@ -620,8 +762,16 @@ func DnsProbeDoHWithClient(ctx context.Context, resolverIP string, domain string
 
 	result.Responded = true
 	result.AnswerIPs = ips
+	result.Header, result.HeaderOK = dohHeader(dohResp), true
 	result.IsPoisoned = !truth.Verify(ips)
 	return result
+}
+
+// dohHeader synthesizes a DnsHeader from the flags exposed by the DoH JSON API.
+// The JSON format carries QR implicitly (it's always a response) plus TC/RD/RA
+// and Status (rcode); the wire-only fields (ID, AA, counts) are left zero.
+func dohHeader(r dohJSONResponse) DnsHeader {
+	return DnsHeader{QR: true, TC: r.TC, RD: r.RD, RA: r.RA, Rcode: uint8(r.Status)}
 }
 
 // truncErr truncates an error message to keep logs clean.

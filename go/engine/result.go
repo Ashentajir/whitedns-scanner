@@ -15,6 +15,19 @@ type ScanResult struct {
 	// DNS Discovery Mode fields (empty/false for regular HTTP scans)
 	DnsProtocol string // "UDP", "TCP", "DoT", "DoH", or "" for non-DNS scans
 	IsPoisoned  bool   // true if the resolver returned an IP mismatching the truth table
+
+	// DNS response header flags (flat basic types for gomobile compatibility).
+	// Populated for wire probes (UDP/TCP/DoT); zero for DoH JSON and HTTP scans.
+	HdrValid bool   // true if a DNS header was parsed for this probe
+	HdrDump  string // full single-line header dump (all flags + section counts)
+	RA       bool   // Recursion Available — resolver is an open recursor
+	TC       bool   // TrunCation bit set
+	Rcode    int    // DNS response code
+	Edns     bool   // resolver returned an EDNS0 OPT record
+
+	// Tunnel-suitability verdict for this resolver (see classifyTunnel).
+	TunnelReady  bool   // open recursion + EDNS0 + TXT passthrough all satisfied
+	TunnelReason string // short explanation of why ready / what is missing
 }
 
 // ResultHandler is a callback interface for delivering events out of the engine.

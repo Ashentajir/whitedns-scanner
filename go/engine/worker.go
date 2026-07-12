@@ -221,6 +221,51 @@ func (e *Engine) checkStateOrWait(ctx context.Context) bool {
 // DNS protocols (UDP/TCP/DoT/DoH), and emits one ScanResult per protocol.
 // ════════════════════════════════════════════════════════════════════════════════
 
+// classifyTunnel decides whether a resolver probe is suitable for DNS tunneling
+// per the criteria: open recursion (RA=1) + EDNS0 large-payload support + TXT
+// passthrough. Poisoning is intentionally NOT a disqualifier — a poisoning
+// resolver can still carry a tunnel — it is reported separately. The returned
+// reason lists what is missing so the report explains each verdict.
+func classifyTunnel(pr DnsProbeResult, txtPassthrough bool) (bool, string) {
+	if !pr.Responded {
+		return false, "no-response"
+	}
+	var missing []string
+	if pr.HeaderOK && !pr.Header.RA {
+		missing = append(missing, "no-recursion(RA=0)")
+	}
+	if !pr.EDNS {
+		missing = append(missing, "no-edns0")
+	}
+	if !txtPassthrough {
+		missing = append(missing, "no-txt-passthrough")
+	}
+	if len(missing) == 0 {
+		return true, "open-recursor+edns0+txt-passthrough"
+	}
+	return false, strings.Join(missing, ",")
+}
+
+// txtPassthroughCheck sends a single TXT query for a domain known to carry TXT
+// records and reports whether the resolver returned TXT rdata. It uses the
+// configured TXT base domain when set (which the operator may control), else the
+// integrity TargetDomain. Uses UDP on port 53 (or the first custom port).
+func (e *Engine) txtPassthroughCheck(ctx context.Context, resolverIP string, timeout time.Duration) bool {
+	txtDomain := strings.TrimSpace(e.config.DnsTxtDomain)
+	if txtDomain == "" {
+		txtDomain = e.config.TargetDomain
+	}
+	if txtDomain == "" {
+		return false
+	}
+	port := 53
+	if len(e.config.CustomPorts) > 0 {
+		port = e.config.CustomPorts[0]
+	}
+	tp := DnsProbeTXTUDPWithDialer(ctx, resolverIP, txtDomain, timeout, e.configuredDialer(), port)
+	return tp.Responded && len(tp.AnswerTXT) > 0
+}
+
 // dnsProtocolPort maps DNS protocol names to their canonical port numbers.
 func dnsProtocolPort(proto string) int {
 	if idx := strings.LastIndex(proto, "/"); idx != -1 && idx < len(proto)-1 {
@@ -283,6 +328,15 @@ func (e *Engine) dnsWorker(ctx context.Context, jobs <-chan Target, results chan
 			probeResults = DnsProbe(ctx, resolverIP, domain, truth, timeout, e.configuredDialer(), e.configuredDoHClient(), probePorts, e.config.DnsUdpTcpOnly)
 		}
 
+		// In A-record mode we don't yet know whether the resolver forwards TXT
+		// rdata intact (the channel classic tunnels ride on). Run one extra TXT
+		// query against a domain that actually has TXT records to find out.
+		// In TXT mode each probe already carries its own passthrough signal.
+		txtPassthrough := false
+		if !e.config.DnsTxtMode {
+			txtPassthrough = e.txtPassthroughCheck(ctx, resolverIP, timeout)
+		}
+
 		// Emit one ScanResult per protocol probe
 		for _, pr := range probeResults {
 			port := dnsProtocolPort(pr.Protocol)
@@ -312,17 +366,38 @@ func (e *Engine) dnsWorker(ctx context.Context, jobs <-chan Target, results chan
 				}
 			}
 
+			// Tunnel suitability: TXT mode probes self-report passthrough; A-mode
+			// probes borrow the per-resolver passthrough check above.
+			txtOK := txtPassthrough
+			if e.config.DnsTxtMode {
+				txtOK = pr.Responded && len(pr.AnswerTXT) > 0
+			}
+			tunnelReady, tunnelReason := classifyTunnel(pr, txtOK)
+
+			hdrDump := ""
+			if pr.HeaderOK {
+				hdrDump = pr.Header.String()
+			}
+
 			results <- ScanResult{
-				Label:       target.Label,
-				URL:         fmt.Sprintf("dns://%s:%d", resolverIP, port),
-				ResolvedIP:  answerIP,
-				DnsAnswer:   answerText,
-				Port:        port,
-				Status:      status,
-				LatencyMs:   int(pr.TTFB.Milliseconds()),
-				Error:       errStr,
-				DnsProtocol: pr.Protocol,
-				IsPoisoned:  pr.IsPoisoned,
+				Label:        target.Label,
+				URL:          fmt.Sprintf("dns://%s:%d", resolverIP, port),
+				ResolvedIP:   answerIP,
+				DnsAnswer:    answerText,
+				Port:         port,
+				Status:       status,
+				LatencyMs:    int(pr.TTFB.Milliseconds()),
+				Error:        errStr,
+				DnsProtocol:  pr.Protocol,
+				IsPoisoned:   pr.IsPoisoned,
+				HdrValid:     pr.HeaderOK,
+				HdrDump:      hdrDump,
+				RA:           pr.Header.RA,
+				TC:           pr.Header.TC,
+				Rcode:        int(pr.Header.Rcode),
+				Edns:         pr.EDNS,
+				TunnelReady:  tunnelReady,
+				TunnelReason: tunnelReason,
 			}
 		}
 	}

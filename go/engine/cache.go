@@ -281,6 +281,137 @@ func SaveRawIPDump(path string, openResults []ScanResult, deadResults []ScanResu
 	return writer.Flush()
 }
 
+// resolverIPFromResult extracts the probed resolver IP from a DNS result's
+// "dns://ip:port" URL, falling back to the Label (which is the IP in DNS modes).
+func resolverIPFromResult(r ScanResult) string {
+	if strings.HasPrefix(r.URL, "dns://") {
+		trimmed := strings.TrimPrefix(r.URL, "dns://")
+		if host, _, err := net.SplitHostPort(trimmed); err == nil {
+			return host
+		}
+	}
+	return r.Label
+}
+
+// collectDnsResults flattens the result buckets down to just the DNS-probe rows.
+func collectDnsResults(buckets ...[]ScanResult) []ScanResult {
+	out := make([]ScanResult, 0)
+	for _, b := range buckets {
+		for _, r := range b {
+			if r.DnsProtocol != "" {
+				out = append(out, r)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Label != out[j].Label {
+			return out[i].Label < out[j].Label
+		}
+		return out[i].DnsProtocol < out[j].DnsProtocol
+	})
+	return out
+}
+
+func yn(v bool) string {
+	if v {
+		return "Y"
+	}
+	return "N"
+}
+
+// SaveDnsHeaderDump writes the full parsed DNS header for every probe — every
+// flag and section count — one line per resolver/protocol. This is the
+// "full header dump per probe" output.
+func SaveDnsHeaderDump(path string, buckets ...[]ScanResult) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	if err := writeReportString(writer, "DNS Header Dump (per probe)\n"); err != nil {
+		return err
+	}
+	if err := writeReportString(writer, fmt.Sprintf("Generated : %s\n", time.Now().Format("2006-01-02 15:04:05"))); err != nil {
+		return err
+	}
+	if err := writeReportString(writer, "Flags: RA=recursion-available TC=truncated EDNS=EDNS0-OPT POISON=answer-mismatch TUN=tunnel-ready\n"); err != nil {
+		return err
+	}
+	if err := writeReportString(writer, "==================================================================================================\n"); err != nil {
+		return err
+	}
+
+	for _, r := range collectDnsResults(buckets...) {
+		ipPort := fmt.Sprintf("%s:%d", resolverIPFromResult(r), r.Port)
+		hdr := r.HdrDump
+		if hdr == "" {
+			hdr = "(no header parsed)"
+		}
+		line := fmt.Sprintf("%-22s %-8s RA=%s TC=%s EDNS=%s POISON=%s TUN=%s | %s | ans=%s\n",
+			ipPort, r.DnsProtocol, yn(r.RA), yn(r.TC), yn(r.Edns), yn(r.IsPoisoned), yn(r.TunnelReady), hdr, r.DnsAnswer)
+		if err := writeReportString(writer, line); err != nil {
+			return err
+		}
+	}
+	return writer.Flush()
+}
+
+// SaveTunnelReport lists resolvers deemed suitable for DNS tunneling
+// (open recursion + EDNS0 + TXT passthrough), deduplicated by resolver+protocol.
+// Poisoning status is shown but does not exclude a resolver.
+func SaveTunnelReport(path string, buckets ...[]ScanResult) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	if err := writeReportString(writer, "Tunnel-Ready DNS Resolvers\n"); err != nil {
+		return err
+	}
+	if err := writeReportString(writer, fmt.Sprintf("Generated : %s\n", time.Now().Format("2006-01-02 15:04:05"))); err != nil {
+		return err
+	}
+	if err := writeReportString(writer, "Criteria  : open recursion (RA=1) + EDNS0 large-payload + TXT passthrough\n"); err != nil {
+		return err
+	}
+	if err := writeReportString(writer, "==================================================================================================\n"); err != nil {
+		return err
+	}
+	if err := writeReportString(writer, fmt.Sprintf("%-22s %-8s %8s  %-7s  %s\n", "Resolver:Port", "Proto", "Latency", "Poison", "Reason")); err != nil {
+		return err
+	}
+	if err := writeReportString(writer, "--------------------------------------------------------------------------------------------------\n"); err != nil {
+		return err
+	}
+
+	seen := make(map[string]struct{})
+	count := 0
+	for _, r := range collectDnsResults(buckets...) {
+		if !r.TunnelReady {
+			continue
+		}
+		key := fmt.Sprintf("%s|%s", resolverIPFromResult(r), r.DnsProtocol)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		count++
+		ipPort := fmt.Sprintf("%s:%d", resolverIPFromResult(r), r.Port)
+		line := fmt.Sprintf("%-22s %-8s %6dms  %-7s  %s\n", ipPort, r.DnsProtocol, r.LatencyMs, yn(r.IsPoisoned), r.TunnelReason)
+		if err := writeReportString(writer, line); err != nil {
+			return err
+		}
+	}
+	if err := writeReportString(writer, fmt.Sprintf("\nTotal tunnel-ready probes: %d\n", count)); err != nil {
+		return err
+	}
+	return writer.Flush()
+}
+
 func isHijackedIP(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
@@ -322,12 +453,14 @@ func isHijackedIP(ipStr string) bool {
 }
 
 // WriteReports is a helper to write all logs at once to a specific directory.
-func WriteReports(outDir, openPath, fullPath, poisonedPath, hijackedPath, rawIPPath, cachePath string, openResults []ScanResult, deadResults []ScanResult, poisonedResults []ScanResult, total int) error {
+func WriteReports(outDir, openPath, fullPath, poisonedPath, hijackedPath, rawIPPath, tunnelPath, headerPath, cachePath string, openResults []ScanResult, deadResults []ScanResult, poisonedResults []ScanResult, total int) error {
 	openFile := filepath.Join(outDir, openPath)
 	fullFile := filepath.Join(outDir, fullPath)
 	poisonedFile := filepath.Join(outDir, poisonedPath)
 	hijackedFile := filepath.Join(outDir, hijackedPath)
 	rawIPFile := filepath.Join(outDir, rawIPPath)
+	tunnelFile := filepath.Join(outDir, tunnelPath)
+	headerFile := filepath.Join(outDir, headerPath)
 	cacheFile := filepath.Join(outDir, cachePath)
 
 	hijackedResults := make([]ScanResult, 0)
@@ -371,6 +504,14 @@ func WriteReports(outDir, openPath, fullPath, poisonedPath, hijackedPath, rawIPP
 		return err
 	}
 	if err := SaveRawIPDump(rawIPFile, openResults, deadResults, poisonedResults, hijackedResults); err != nil {
+		return err
+	}
+	// DNS-mode extras: per-probe header dump and the tunnel-ready shortlist.
+	// These are no-ops (empty files) for plain HTTP scans.
+	if err := SaveDnsHeaderDump(headerFile, openResults, deadResults, poisonedResults); err != nil {
+		return err
+	}
+	if err := SaveTunnelReport(tunnelFile, openResults, deadResults, poisonedResults); err != nil {
 		return err
 	}
 	if err := SaveCache(cacheFile, openResults); err != nil {

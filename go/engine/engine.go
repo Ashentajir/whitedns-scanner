@@ -399,6 +399,8 @@ func (e *Engine) collectResults(ctx context.Context, results chan ScanResult) {
 	poisonedPath := fmt.Sprintf("poisoned_dns_%s.txt", timestamp)
 	hijackedPath := fmt.Sprintf("hijacked_dns_%s.txt", timestamp)
 	rawIPPath := fmt.Sprintf("raw_ip_dump_%s.txt", timestamp)
+	tunnelPath := fmt.Sprintf("tunnel_ready_%s.txt", timestamp)
+	headerPath := fmt.Sprintf("dns_headers_%s.txt", timestamp)
 	debugPath := fmt.Sprintf("debug_count_%s.txt", timestamp)
 
 	// Write debug counts
@@ -423,7 +425,7 @@ func (e *Engine) collectResults(ctx context.Context, results chan ScanResult) {
 		f.Close()
 	}
 
-	if err := WriteReports(e.config.OutputDir, openPath, fullPath, poisonedPath, hijackedPath, rawIPPath, e.config.CacheFile, openResults, deadResults, poisonedResults, e.totalCount); err != nil {
+	if err := WriteReports(e.config.OutputDir, openPath, fullPath, poisonedPath, hijackedPath, rawIPPath, tunnelPath, headerPath, e.config.CacheFile, openResults, deadResults, poisonedResults, e.totalCount); err != nil {
 		e.handler.OnStateChange(fmt.Sprintf("ERROR: Report write failed: %v", err))
 	}
 
